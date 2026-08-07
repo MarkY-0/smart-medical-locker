@@ -60,6 +60,35 @@ def send_telegram_alert(message):
         print("Telegram alert failed - no network? Locker still running.")
         return False
 
+def describe_conditions(temperature, humidity, tilt_state, temp_bad, humidity_bad, tilt_bad, TEMP_THRESHOLD, HUMIDITY_THRESHOLD):
+    #builds a line-by-line breakdown of exactly which factor(s) are out of range and by
+    #how much, so an alert read on a phone during transport says what is actually wrong
+    #without the reader needing to know the thresholds or do any comparison themselves
+    lines = []
+
+    if temperature is None:
+        lines.append("Temperature: sensor reading unavailable")
+    elif temp_bad:
+        over_by = temperature - TEMP_THRESHOLD
+        lines.append("Temperature: " + str(temperature) + " deg C (limit " + str(TEMP_THRESHOLD) + " deg C) - OVER by " + str(round(over_by, 1)) + " deg C")
+    else:
+        lines.append("Temperature: " + str(temperature) + " deg C (limit " + str(TEMP_THRESHOLD) + " deg C) - OK")
+
+    if humidity is None:
+        lines.append("Humidity: sensor reading unavailable")
+    elif humidity_bad:
+        over_by = humidity - HUMIDITY_THRESHOLD
+        lines.append("Humidity: " + str(humidity) + " %RH (limit " + str(HUMIDITY_THRESHOLD) + " %RH) - OVER by " + str(round(over_by, 1)) + " %RH")
+    else:
+        lines.append("Humidity: " + str(humidity) + " %RH (limit " + str(HUMIDITY_THRESHOLD) + " %RH) - OK")
+
+    if tilt_bad:
+        lines.append("Tilt/tamper switch: TRIGGERED - the locker has been moved or tilted")
+    else:
+        lines.append("Tilt/tamper switch: OK - resting normally")
+
+    return "\n".join(lines)
+
 #---pin setup (from the shield's own pin map, see RPi Training Kit User Guide)---
 TILT_PIN = 22       #confirmed by pin-scan: the tilt switch is wired to the shield's slide switch terminal. LOW = normal, HIGH = tilt/breach
 STATUS_LED_PIN = 24  #the shield only has ONE built-in LED (confirmed red) - solid on = approved/unlocked, blinking = denied/breach
@@ -290,8 +319,9 @@ def poll_sensors_and_check_breach():
 
     if is_hard_breach and not breach_flag:
         breach_flag = True
-        vault_state_text = "UNLOCKED (vault is currently open!)" if vault_is_open else "locked"
-        send_telegram_alert("ALERT: HARD BREACH - Smart Medical Locker locked down at " + time.strftime("%Y-%m-%d %H:%M:%S") + "! temp=" + str(temperature) + " humidity=" + str(humidity) + " tilt=" + str(tilt_state) + " - vault is " + vault_state_text + ". Access disabled until conditions clear.")
+        vault_state_text = "UNLOCKED - vault is currently open!" if vault_is_open else "locked"
+        details = describe_conditions(temperature, humidity, tilt_state, temp_bad, humidity_bad, tilt_bad, TEMP_THRESHOLD, HUMIDITY_THRESHOLD)
+        send_telegram_alert("ALERT: HARD BREACH\nSmart Medical Locker locked down at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\nVault status: " + vault_state_text + "\n\n" + details + "\n\nAccess is disabled until all conditions return to normal.")
         blink_led(STATUS_LED_PIN, 3)
 
     if (not is_hard_breach) and breach_flag:
@@ -300,7 +330,8 @@ def poll_sensors_and_check_breach():
 
     if is_soft_warning and not warning_active:
         warning_active = True
-        send_telegram_alert("WARNING: Smart Medical Locker detected an anomaly at " + time.strftime("%Y-%m-%d %H:%M:%S") + " - temp=" + str(temperature) + " humidity=" + str(humidity) + " tilt=" + str(tilt_state) + ". Access still allowed but flagged for review.")
+        details = describe_conditions(temperature, humidity, tilt_state, temp_bad, humidity_bad, tilt_bad, TEMP_THRESHOLD, HUMIDITY_THRESHOLD)
+        send_telegram_alert("WARNING: anomaly detected\nSmart Medical Locker at " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n\n" + details + "\n\nAccess is still allowed but this event has been flagged for review.")
 
     if (not is_soft_warning) and warning_active:
         warning_active = False
@@ -313,89 +344,96 @@ def poll_sensors_and_check_breach():
         last_upload_time = current_time
 
 #=====================================================================
-# STARTUP MENU - choose the limits on the locker itself, using the
-# keypad and the LCD. No computer keyboard is needed.
+# MODE MENU - choose the limits on the locker itself, using the keypad
+# and the LCD. No computer keyboard is needed.
 #
 #   1 = Live mode  : the real cold-chain limits this locker is built for
 #   2 = Demo mode  : type your own limits, so all three alert levels can
 #                    be shown in an ordinary room that is not a fridge
 #
-# If the keypad ever misbehaves, the whole menu can be skipped from the
-# command line instead:
+# Runs once at startup, and again any time * is pressed while the vault
+# is idle (waiting for a card) - so switching modes never needs going
+# back to the terminal. The command-line shortcuts only apply on that
+# first startup call, not on a later switch from the keypad:
 #   python3 main.py live
 #   python3 main.py demo 27 70      <- temperature limit, humidity limit
 #=====================================================================
-print("")
-print("=========================================")
-print("        SMART MEDICAL LOCKER")
-print("=========================================")
+def choose_mode(is_startup):
+    global TEMP_THRESHOLD, HUMIDITY_THRESHOLD
 
-if len(sys.argv) > 1 and sys.argv[1] == "live":
-    choice = "1"
-elif len(sys.argv) > 3 and sys.argv[1] == "demo":
-    choice = "2"
-else:
-    print("  Choose on the keypad:")
-    print("    1 = Live mode (" + str(LIVE_TEMP_THRESHOLD) + " deg C, " + str(LIVE_HUMIDITY_THRESHOLD) + " %RH)")
-    print("    2 = Demo mode (set your own limits)")
-    show_lcd("1=Live  2=Demo", "Press a key...")
-    choice = ""
-    while choice != "1" and choice != "2":
-        choice = str(read_single_key())
+    print("")
+    print("=========================================")
+    print("        SMART MEDICAL LOCKER")
+    print("=========================================")
 
-if choice == "1":
-    TEMP_THRESHOLD = LIVE_TEMP_THRESHOLD
-    HUMIDITY_THRESHOLD = LIVE_HUMIDITY_THRESHOLD
-    show_lcd("Live mode", "T" + str(TEMP_THRESHOLD) + "C  H" + str(HUMIDITY_THRESHOLD) + "%")
-    print("Live mode - temperature limit " + str(TEMP_THRESHOLD) + " deg C, humidity limit " + str(HUMIDITY_THRESHOLD) + " %RH")
-    sleep(2)
-
-else:
-    #show what the sensors are reading right now, before any limits are chosen, so the
-    #operator can set them either side of the real room conditions instead of guessing.
-    #The same reading is pushed to Telegram so it can be read off a phone as well.
-    show_lcd("Demo mode", "Reading sensor")
-    print("Reading the sensors, please wait...")
-
-    setup_temp = None
-    setup_humidity = None
-    for i in range(10):
-        setup_result = dht_sensor.read()
-        if setup_result.is_valid():
-            setup_temp = setup_result.temperature
-            setup_humidity = setup_result.humidity
-            break
-        sleep(1.5)
-
-    setup_tilt = GPIO.input(TILT_PIN)
-
-    reading_text = "temperature " + str(setup_temp) + " deg C, humidity " + str(setup_humidity) + " %RH, tilt " + str(setup_tilt)
-    print("Right now the locker reads: " + reading_text)
-    print("Set a limit BELOW a reading to make it count as bad, or ABOVE it to keep it good.")
-    sent = send_telegram_alert("Smart Medical Locker - demo setup. The locker currently reads " + reading_text + ". Choose the temperature and humidity limits either side of these values.")
-    if sent:
-        print("(the same reading has been sent to Telegram)")
-        lcd_line2 = "Sent to Telegram"
+    if is_startup and len(sys.argv) > 1 and sys.argv[1] == "live":
+        choice = "1"
+    elif is_startup and len(sys.argv) > 3 and sys.argv[1] == "demo":
+        choice = "2"
     else:
-        lcd_line2 = "No network"
+        print("  Choose on the keypad:")
+        print("    1 = Live mode (" + str(LIVE_TEMP_THRESHOLD) + " deg C, " + str(LIVE_HUMIDITY_THRESHOLD) + " %RH)")
+        print("    2 = Demo mode (set your own limits)")
+        show_lcd("1=Live  2=Demo", "Press a key...")
+        choice = ""
+        while choice != "1" and choice != "2":
+            choice = str(read_single_key())
 
-    #hold the live readings on the screen so they can be copied down before typing limits
-    show_lcd("Now T" + str(setup_temp) + " H" + str(setup_humidity), lcd_line2)
-    sleep(5)
+    if choice == "1":
+        TEMP_THRESHOLD = LIVE_TEMP_THRESHOLD
+        HUMIDITY_THRESHOLD = LIVE_HUMIDITY_THRESHOLD
+        show_lcd("Live mode", "T" + str(TEMP_THRESHOLD) + "C  H" + str(HUMIDITY_THRESHOLD) + "%")
+        print("Live mode - temperature limit " + str(TEMP_THRESHOLD) + " deg C, humidity limit " + str(HUMIDITY_THRESHOLD) + " %RH")
+        sleep(2)
 
-    if len(sys.argv) > 3:
-        TEMP_THRESHOLD = int(sys.argv[2])
-        HUMIDITY_THRESHOLD = int(sys.argv[3])
     else:
-        TEMP_THRESHOLD = read_number_from_keypad("Temp limit? #=ok")
-        HUMIDITY_THRESHOLD = read_number_from_keypad("Humid limit?#=ok")
+        #show what the sensors are reading right now, before any limits are chosen, so the
+        #operator can set them either side of the real room conditions instead of guessing.
+        #The same reading is pushed to Telegram so it can be read off a phone as well.
+        show_lcd("Demo mode", "Reading sensor")
+        print("Reading the sensors, please wait...")
 
-    show_lcd("Demo mode", "T" + str(TEMP_THRESHOLD) + "C  H" + str(HUMIDITY_THRESHOLD) + "%")
-    print("Demo mode - temperature limit " + str(TEMP_THRESHOLD) + " deg C, humidity limit " + str(HUMIDITY_THRESHOLD) + " %RH")
-    sleep(2)
+        setup_temp = None
+        setup_humidity = None
+        for i in range(10):
+            setup_result = dht_sensor.read()
+            if setup_result.is_valid():
+                setup_temp = setup_result.temperature
+                setup_humidity = setup_result.humidity
+                break
+            sleep(1.5)
 
-print("Smart Medical Locker starting up...")
-show_lcd("Vault Secured", "Tap card...")
+        setup_tilt = GPIO.input(TILT_PIN)
+
+        reading_text = "temperature " + str(setup_temp) + " deg C, humidity " + str(setup_humidity) + " %RH, tilt " + str(setup_tilt)
+        print("Right now the locker reads: " + reading_text)
+        print("Set a limit BELOW a reading to make it count as bad, or ABOVE it to keep it good.")
+        sent = send_telegram_alert("Smart Medical Locker - demo setup. The locker currently reads " + reading_text + ". Choose the temperature and humidity limits either side of these values.")
+        if sent:
+            print("(the same reading has been sent to Telegram)")
+            lcd_line2 = "Sent to Telegram"
+        else:
+            lcd_line2 = "No network"
+
+        #hold the live readings on the screen so they can be copied down before typing limits
+        show_lcd("Now T" + str(setup_temp) + " H" + str(setup_humidity), lcd_line2)
+        sleep(5)
+
+        if is_startup and len(sys.argv) > 3:
+            TEMP_THRESHOLD = int(sys.argv[2])
+            HUMIDITY_THRESHOLD = int(sys.argv[3])
+        else:
+            TEMP_THRESHOLD = read_number_from_keypad("Temp limit? #=ok")
+            HUMIDITY_THRESHOLD = read_number_from_keypad("Humid limit?#=ok")
+
+        show_lcd("Demo mode", "T" + str(TEMP_THRESHOLD) + "C  H" + str(HUMIDITY_THRESHOLD) + "%")
+        print("Demo mode - temperature limit " + str(TEMP_THRESHOLD) + " deg C, humidity limit " + str(HUMIDITY_THRESHOLD) + " %RH")
+        sleep(2)
+
+    print("Smart Medical Locker ready.")
+    show_lcd("Vault Secured", "Tap card...")
+
+choose_mode(is_startup=True)
 
 while True:
 
@@ -406,6 +444,12 @@ while True:
     uid = reader.read_id_no_block()
 
     if uid is None:
+        #while idle (no card present), * reopens the mode menu so Live/Demo
+        #can be switched, or the demo limits changed, without touching the
+        #terminal at all
+        key = read_keypad_digit()
+        if key == '*':
+            choose_mode(is_startup=False)
         sleep(0.1) #100ms idle delay, then loop back up to keep polling sensors
         continue
 
